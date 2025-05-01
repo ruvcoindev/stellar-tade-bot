@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: stellar-trading-bot
+    restart: unless-stopped
+    environment:
+      - SECRET_KEY
+      - ISSUER_ADDRESS
+      - BASE_ASSET_CODE
+    volumes:
+      - ./logs:/usr/src/app/logs
+      - ./trading.db:/usr/src/app/trading.db
+    env_file:
+      - .env
