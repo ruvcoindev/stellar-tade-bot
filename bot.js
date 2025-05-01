@@ -2,30 +2,30 @@ require('dotenv').config();
 const { Server, Keypair, Asset, TransactionBuilder, Operation, Networks } = require('@stellar/stellar-sdk');
 const axios = require('axios');
 const winston = require('winston');
-const { format, transports } = winston;
-const { combine, timestamp, printf } = format;
+const indicators = require('technicalindicators');
+const nodemailer = require('nodemailer');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const path = require('path');
 
 // Настройка логгера
-const logFormat = printf(({ level, message, timestamp }) => {
+const logFormat = winston.format.printf(({ level, message, timestamp }) => {
   return `${timestamp} [${level.toUpperCase()}]: ${message}`;
 });
 
 const logger = winston.createLogger({
   level: 'debug',
-  format: combine(
-    timestamp(),
+  format: winston.format.combine(
+    winston.format.timestamp(),
     logFormat
   ),
   transports: [
-    new transports.File({ filename: process.env.LOG_FILE }),
-    new transports.Console()
+    new winston.transports.File({ filename: process.env.LOG_FILE }),
+    new winston.transports.Console()
   ]
 });
 
-// Настройки
+// Конфигурация
 const secretKey = process.env.SECRET_KEY;
 const issuerAddress = process.env.ISSUER_ADDRESS;
 const baseAssetCode = process.env.BASE_ASSET_CODE;
@@ -92,7 +92,7 @@ function createTables() {
   });
 }
 
-// Инициализация Stellar SDK
+// Инициализация сервера Stellar
 const server = new Server(horizonUrl, {
   allowHttp: horizonUrl.includes('testnet')
 });
@@ -101,20 +101,6 @@ const accountKeypair = Keypair.fromSecret(secretKey);
 // Определение активов
 const baseAsset = new Asset(baseAssetCode, issuerAddress);
 const counterAsset = Asset.native(); // XLM
-
-// Функция для проверки лимитов Horizon API
-async function checkApiRateLimits(response) {
-  const remaining = parseInt(response.headers['x-ratelimit-remaining']);
-  const limit = parseInt(response.headers['x-ratelimit-limit']);
-  const resetTime = new Date(parseInt(response.headers['x-ratelimit-reset']) * 1000);
-  
-  logger.debug(`Лимиты API: ${remaining}/${limit}, сброс через ${resetTime.toLocaleTimeString()}`);
-  
-  if (remaining < 10) {
-    logger.warn(`Осталось менее 10 запросов до сброса лимитов!`);
-    sendEmail('Предупреждение: Лимиты Horizon API', `Осталось ${remaining}/${limit} запросов. Сброс через ${resetTime.toLocaleTimeString()}`);
-  }
-}
 
 // Функция для получения баланса аккаунта
 async function getAccountBalance() {
@@ -150,7 +136,6 @@ async function getAccountBalance() {
 async function getTradeHistory(limit = 100) {
   try {
     const response = await server.trades().forAssetPair(baseAsset, counterAsset).limit(limit).call();
-    await checkApiRateLimits(response); // Проверка лимитов
     return response.records.map(record => ({
       price: parseFloat(record.price),
       baseAmount: parseFloat(record.base_amount),
@@ -172,18 +157,17 @@ function calculateIndicators(prices) {
   }
   
   // MA (Moving Average)
-  const ma = require('technicalindicators').SMA.calculate({ period: 14, values: closePrices });
+  const ma = indicators.SMA.calculate({ period: 14, values: closePrices });
   // RSI (Relative Strength Index)
-  const rsi = require('technicalindicators').RSI.calculate({ period: 14, values: closePrices });
+  const rsi = indicators.RSI.calculate({ period: 14, values: closePrices });
   // MACD (Moving Average Convergence Divergence)
-  const macd = require('technicalindicators').MACD.calculate({ 
+  const macd = indicators.MACD.calculate({ 
     shortPeriod: 12, 
     longPeriod: 26, 
     signalPeriod: 9, 
     values: closePrices 
   });
   
-  // Сохранение индикаторов в БД
   if (ma.length > 0 && rsi.length > 0 && macd.length > 0) {
     const stmt = db.prepare('INSERT INTO indicators (ma, rsi, macd, signal) VALUES (?, ?, ?, ?)');
     stmt.run(ma[ma.length - 1], rsi[rsi.length - 1], macd[0][macd[0].length - 1], macd[1][macd[1].length - 1]);
@@ -214,11 +198,7 @@ async function createBuyOrder(price, amount) {
     transaction.sign(accountKeypair);
     const result = await server.submitTransaction(transaction);
     logger.info('Ордер на покупку создан:', result.hash);
-    
-    // Сохранение ордера в БД
-    const stmt = db.prepare('INSERT INTO orders (type, price, amount, status) VALUES (?, ?, ?, ?)');
-    stmt.run('buy', price, amount, 'pending');
-    stmt.finalize();
+    sendEmail('Ордер на покупку создан', `Цена: ${price}, Кол-во: ${amount}`);
     
     // Создание стоп-лосс и тейк-профит
     await createStopLossAndTakeProfit(price, amount, true);
@@ -251,11 +231,7 @@ async function createSellOrder(price, amount) {
     transaction.sign(accountKeypair);
     const result = await server.submitTransaction(transaction);
     logger.info('Ордер на продажу создан:', result.hash);
-    
-    // Сохранение ордера в БД
-    const stmt = db.prepare('INSERT INTO orders (type, price, amount, status) VALUES (?, ?, ?, ?)');
-    stmt.run('sell', price, amount, 'pending');
-    stmt.finalize();
+    sendEmail('Ордер на продажу создан', `Цена: ${price}, Кол-во: ${amount}`);
     
     // Создание стоп-лосс и тейк-профит
     await createStopLossAndTakeProfit(price, amount, false);
@@ -292,7 +268,7 @@ async function createStopLossAndTakeProfit(entryPrice, amount, isBuyOrder) {
   }
 }
 
-// Функция для анализа рынка и принятия решений
+// Функция для анализа рынка
 async function analyzeMarket() {
   try {
     const tradeHistory = await getTradeHistory(100);
@@ -312,16 +288,12 @@ async function analyzeMarket() {
     logger.info(`Текущая цена: ${lastPrice.toFixed(7)}`);
     logger.info(`MA: ${ma.toFixed(7)}, RSI: ${rsi.toFixed(2)}, MACD: ${macdLine.toFixed(7)}, Signal: ${signalLine.toFixed(7)}`);
     
-    // Стратегия торговли
     let shouldBuy = false;
     let shouldSell = false;
     
-    // Условия для покупки
     if (lastPrice > ma && rsi < 30 && macdLine > signalLine) {
       shouldBuy = true;
-    }
-    // Условия для продажи
-    else if (lastPrice < ma && rsi > 70 && macdLine < signalLine) {
+    } else if (lastPrice < ma && rsi > 70 && macdLine < signalLine) {
       shouldSell = true;
     }
     
@@ -330,11 +302,9 @@ async function analyzeMarket() {
       return;
     }
     
-    // Получаем баланс аккаунта
     const { ruvBalance, xlmBalance } = await getAccountBalance();
     logger.info(`Текущий баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
     
-    // Выполняем сделку
     if (shouldBuy && xlmBalance >= 0.001) {
       const buyPrice = lastPrice * 0.99; // Покупаем на 1% ниже текущей цены
       const buyAmountXLM = Math.min(xlmBalance * 0.5, 10); // Половина баланса, максимум 10 XLM
@@ -355,14 +325,14 @@ function sendEmail(subject, body) {
   const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-      user: emailUser,
-      pass: emailPassword
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASSWORD
     }
   });
   
   const mailOptions = {
-    from: emailUser,
-    to: emailTo,
+    from: process.env.EMAIL_USER,
+    to: process.env.EMAIL_TO,
     subject,
     text: body
   };
@@ -380,7 +350,6 @@ function sendEmail(subject, body) {
 async function startBot() {
   logger.info('Бот запущен. Начинаю анализ рынка...');
   
-  // Проверка подключения к сети
   try {
     const network = await server.fetchBaseFee();
     logger.info(`Подключение к сети Stellar успешно. Базовая комиссия: ${network}`);
@@ -389,7 +358,6 @@ async function startBot() {
     process.exit(1);
   }
   
-  // Запуск анализа
   setInterval(async () => {
     try {
       await analyzeMarket();
