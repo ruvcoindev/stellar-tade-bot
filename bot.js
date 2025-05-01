@@ -25,7 +25,7 @@ const logger = winston.createLogger({
   ]
 });
 
-// Настройки
+// Настройки из .env
 const secretKey = process.env.SECRET_KEY;
 const issuerAddress = process.env.ISSUER_ADDRESS;
 const baseAssetCode = process.env.BASE_ASSET_CODE;
@@ -40,7 +40,7 @@ const testXlmBalance = parseFloat(process.env.TEST_XLM_BALANCE);
 const testRuvBalance = parseFloat(process.env.TEST_RUV_BALANCE);
 
 // Инициализация базы данных
-const dbPath = path.join(__dirname, process.env.DATABASE_NAME);
+const dbPath = path.join(__dirname, process.env.DATABASE_NAME || 'database.sqlite');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     logger.error('Ошибка подключения к БД:', err.message);
