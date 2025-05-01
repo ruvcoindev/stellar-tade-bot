@@ -1,6 +1,6 @@
+// bot.js
 require('dotenv').config();
 const { Horizon, Keypair, Asset, TransactionBuilder, Operation, Networks, BASE_FEE } = require('@stellar/stellar-sdk');
-const axios = require('axios');
 const winston = require('winston');
 const { format, transports } = winston;
 const { combine, timestamp, printf } = format;
@@ -8,15 +8,13 @@ const indicators = require('technicalindicators');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const DailyRotateFile = require('winston-daily-rotate-file');
+const fetch = require('node-fetch');
 
-// Конфигурация retry
-const MAX_RETRIES = 3;
-const INITIAL_RETRY_DELAY = 1000;
-
-// Настройка логгера с ротацией
+// 1. ИНИЦИАЛИЗАЦИЯ ЛОГГЕРА
 const logFormat = printf(({ level, message, timestamp }) => {
   return `${timestamp} [${level.toUpperCase()}]: ${message}`;
 });
+
 const logger = winston.createLogger({
   level: 'debug',
   format: combine(
@@ -31,537 +29,724 @@ const logger = winston.createLogger({
       maxSize: '20m',
       maxFiles: '14d'
     }),
-    new winston.transports.Console()
+    new transports.Console()
   ]
 });
 
-// Конфигурация
-const secretKey = process.env.SECRET_KEY;
-const issuerAddress = process.env.ISSUER_ADDRESS;
-const baseAssetCode = process.env.BASE_ASSET_CODE;
-const counterAssetCode = process.env.COUNTER_ASSET_CODE;
-const horizonUrl = process.env.HORIZON_URL || "https://horizon-testnet.stellar.org";
-const tradeInterval = parseInt(process.env.TRADE_INTERVAL) || 60000;
-const minProfitThreshold = parseFloat(process.env.MIN_PROFIT_THRESHOLD) || 0.01;
-const stopLossPercent = parseFloat(process.env.STOP_LOSS_PERCENT) || 2.0;
-const takeProfitPercent = parseFloat(process.env.TAKE_PROFIT_PERCENT) || 5.0;
-const testMode = process.env.TEST_MODE === 'true';
-const testXlmBalance = parseFloat(process.env.TEST_XLM_BALANCE) || 100;
-const testRuvBalance = parseFloat(process.env.TEST_RUV_BALANCE) || 1000;
+// 2. КОНФИГУРАЦИЯ
+const config = {
+  secretKey: process.env.SECRET_KEY,
+  issuerAddress: process.env.ISSUER_ADDRESS,
+  baseAssetCode: process.env.BASE_ASSET_CODE,
+  horizonUrl: process.env.HORIZON_URL || "https://horizon-testnet.stellar.org",
+  tradeInterval: parseInt(process.env.TRADE_INTERVAL) || 30000,
+  riskPerTrade: parseFloat(process.env.RISK_PER_TRADE) || 0.02,
+  maxPortfolioRisk: parseFloat(process.env.MAX_PORTFOLIO_RISK) || 0.2,
+  trailingStopOffset: parseFloat(process.env.TRAILING_STOP) || 1.5,
+  candleInterval: '5m',
+  candleLimit: 100,
+  minBalanceReserve: 0.5 // Минимальный резерв XLM для комиссий
+};
 
-// Инициализация базы данных
-const dbPath = path.join(__dirname, process.env.DATABASE_NAME || 'database.sqlite');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    logger.error('Ошибка подключения к БД:', err.message);
-  } else {
-    logger.info('Подключение к SQLite БД успешно');
-    createTables();
-  }
+// 3. ИНИЦИАЛИЗАЦИЯ STELLAR
+const server = new Horizon.Server(config.horizonUrl);
+const accountKeypair = Keypair.fromSecret(config.secretKey);
+const baseAsset = new Asset(config.baseAssetCode, config.issuerAddress);
+const counterAsset = Asset.native();
+
+// 4. БАЗА ДАННЫХ
+const db = new sqlite3.Database(path.join(__dirname, 'trading.db'), err => {
+  if (err) logger.error('DB error:', err);
+  else logger.info('Connected to SQLite');
 });
 
-function createTables() {
-  const queries = [
-    `CREATE TABLE IF NOT EXISTS trades (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      price REAL,
-      amount REAL,
-      type TEXT,
-      profit REAL
-    )`,
-    `CREATE TABLE IF NOT EXISTS indicators (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      ma REAL,
-      rsi REAL,
-      macd REAL,
-      signal REAL,
-      atr REAL
-    )`,
-    `CREATE TABLE IF NOT EXISTS orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      order_id TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-      type TEXT,
-      price REAL,
-      amount REAL,
-      status TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS active_orders (
-      order_id TEXT PRIMARY KEY,
-      type TEXT,
-      price REAL,
-      amount REAL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`
-  ];
-  db.serialize(() => {
-    queries.forEach(query => {
-      db.run(query, (err) => {
-        if (err) logger.error(`Ошибка создания таблицы: ${err.message}`);
-      });
-    });
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY,
+    entry_price REAL,
+    position_size REAL,
+    direction TEXT,
+    stop_loss REAL,
+    take_profit REAL,
+    trailing_stop REAL,
+    opened_at DATETIME,
+    closed_at DATETIME
+  )`, [], (err) => {
+    if (err) logger.error('Positions table error:', err);
   });
-}
 
-// Инициализация сервера Stellar
-const server = new Horizon.Server(horizonUrl);
-const accountKeypair = Keypair.fromSecret(secretKey);
+  db.run(`CREATE TABLE IF NOT EXISTS orders (
+    id TEXT PRIMARY KEY,
+    type TEXT,
+    price REAL,
+    amount REAL,
+    status TEXT,
+    created_at DATETIME,
+    updated_at DATETIME
+  )`, [], (err) => {
+    if (err) logger.error('Orders table error:', err);
+  });
 
-// Определение активов
-const baseAsset = new Asset(baseAssetCode, issuerAddress);
-const counterAsset = Asset.native(); // XLM
+  db.run(`CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY,
+    position_id INTEGER,
+    type TEXT,
+    price REAL,
+    amount REAL,
+    profit REAL,
+    timestamp DATETIME
+  )`, [], (err) => {
+    if (err) logger.error('Trades table error:', err);
+  });
+});
 
-// Универсальная функция с retry-логикой
-async function withRetry(operation, retries = MAX_RETRIES, delay = INITIAL_RETRY_DELAY) {
-  try {
-    return await operation();
-  } catch (error) {
-    if (retries > 0 && (error.type === 'request-timeout' || error.status >= 500)) {
-      logger.warn(`Повторная попытка через ${delay}мс. Осталось попыток: ${retries}`);
-      await new Promise(res => setTimeout(res, delay));
-      return withRetry(operation, retries - 1, delay * 2);
+// 5. МОДУЛЬ АГРЕГАЦИИ СВЕЧЕЙ
+class CandleAggregator {
+  constructor(interval) {
+    this.interval = this.parseInterval(interval);
+    this.buckets = {};
+  }
+
+  parseInterval(interval) {
+    const units = {
+      '1m': 60,
+      '5m': 300,
+      '15m': 900,
+      '1h': 3600,
+      '1d': 86400
+    };
+    return units[interval] || 300;
+  }
+
+  roundTimestamp(timestamp) {
+    return Math.floor(timestamp / this.interval) * this.interval;
+  }
+
+  addTrade(trade) {
+    const timestamp = this.roundTimestamp(new Date(trade.ledger_close_time).getTime() / 1000);
+    
+    if (!this.buckets[timestamp]) {
+      this.buckets[timestamp] = {
+        open: parseFloat(trade.price),
+        high: parseFloat(trade.price),
+        low: parseFloat(trade.price),
+        close: parseFloat(trade.price),
+        volume: parseFloat(trade.amount),
+        count: 1
+      };
+    } else {
+      const bucket = this.buckets[timestamp];
+      bucket.close = parseFloat(trade.price);
+      bucket.high = Math.max(bucket.high, parseFloat(trade.price));
+      bucket.low = Math.min(bucket.low, parseFloat(trade.price));
+      bucket.volume += parseFloat(trade.amount);
+      bucket.count++;
     }
-    throw error;
+  }
+
+  getCandles(limit) {
+    const sorted = Object.entries(this.buckets)
+      .map(([ts, data]) => ({
+        ...data,
+        timestamp: parseInt(ts),
+        time: new Date(ts * 1000).toISOString()
+      }))
+      .sort((a, b) => a.timestamp - b.timestamp);
+    
+    return sorted.slice(-limit);
   }
 }
 
-// Функция для проверки существующих ордеров
-async function checkExistingOrders() {
-  try {
-    const accountId = accountKeypair.publicKey();
-    const orders = await withRetry(async () => 
-      await server.orders()
-        .forAccount(accountId)
-        .call()
-    );
+// 6. МОДУЛЬ УПРАВЛЕНИЯ РИСКАМИ
+class RiskManager {
+  constructor() {
+    this.volatilityWindow = 14;
+    this.positionHistory = [];
+  }
+
+  async getPortfolioValue() {
+    try {
+      const account = await server.loadAccount(accountKeypair.publicKey());
+      const balance = account.balances.find(b => b.asset_type === 'native')?.balance || 0;
+      return parseFloat(balance) - config.minBalanceReserve;
+    } catch (error) {
+      logger.error('Failed to load portfolio value:', error);
+      return 0;
+    }
+  }
+
+  async calculateDrawdown() {
+    if (this.positionHistory.length < 2) return 0;
     
-    const activeOrders = orders.records.map(order => ({
-      id: order.id,
-      type: order.type,
-      price: parseFloat(order.price),
-      amount: parseFloat(order.amount),
-      createdAt: order.created_at
-    }));
+    const peak = Math.max(...this.positionHistory.map(p => p.profit));
+    const latest = this.positionHistory[this.positionHistory.length - 1].profit;
+    return (peak - latest) / peak;
+  }
+
+  async calculateATR(candles) {
+    try {
+      const values = candles.map(c => ({
+        high: c.high,
+        low: c.low,
+        close: c.close
+      }));
+      
+      const atrResult = indicators.ATR.calculate({ values, period: 14 });
+      return atrResult[atrResult.length - 1];
+    } catch (error) {
+      logger.error('ATR calculation failed:', error);
+      return 0;
+    }
+  }
+
+  async calculatePositionSize(entryPrice, stopLossPrice) {
+    try {
+      const portfolioValue = await this.getPortfolioValue();
+      if (portfolioValue <= 0) return 0;
+
+      const riskAmount = portfolioValue * config.riskPerTrade;
+      const priceDistance = Math.abs(entryPrice - stopLossPrice);
+      
+      if (priceDistance <= 0) return 0;
+
+      const candles = await getCandleData();
+      const atr = await this.calculateATR(candles);
+      
+      const positionSize = (riskAmount / priceDistance) * (1 - atr/entryPrice);
+      return Math.min(positionSize, portfolioValue * config.maxPortfolioRisk);
+    } catch (error) {
+      logger.error('Position size calculation failed:', error);
+      return 0;
+    }
+  }
+
+  async adjustRiskParameters() {
+    const portfolioValue = await this.getPortfolioValue();
+    const drawdown = await this.calculateDrawdown();
     
-    // Обновляем БД с учетом offerId
-    const stmt = db.prepare('INSERT OR IGNORE INTO active_orders (order_id, type, price, amount) VALUES (?, ?, ?, ?)');
-    activeOrders.forEach(order => {
-      stmt.run(
-        order.id,
-        order.type,
-        order.price,
-        order.amount
+    if (drawdown > 0.1) {
+      config.riskPerTrade = Math.max(0.01, config.riskPerTrade * 0.8);
+    }
+    
+    if (portfolioValue > config.startingBalance * 1.2) {
+      config.riskPerTrade = Math.min(0.05, config.riskPerTrade * 1.1);
+    }
+  }
+
+  async recordTrade(trade) {
+    this.positionHistory.push(trade);
+    return new Promise((resolve, reject) => {
+      db.run(
+        `INSERT INTO trades (position_id, type, price, amount, profit, timestamp) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [trade.position_id, trade.type, trade.price, trade.amount, trade.profit, trade.timestamp],
+        function(err) {
+          if (err) {
+            logger.error('Failed to record trade:', err);
+            reject(err);
+          } else {
+            resolve(this.lastID);
+          }
+        }
       );
     });
-    stmt.finalize();
+  }
+}
+
+// 7. ТОРГОВЫЙ ДВИЖОК
+class TradingEngine {
+  constructor() {
+    this.activePositions = [];
+    this.pendingOrders = [];
+    this.candleAggregator = new CandleAggregator(config.candleInterval);
+    this.lastCandleTime = 0;
+  }
+
+  async syncOpenPositions() {
+    return new Promise((resolve, reject) => {
+      db.all('SELECT * FROM positions WHERE closed_at IS NULL', [], (err, rows) => {
+        if (err) {
+          logger.error('Failed to load positions:', err);
+          reject(err);
+        } else {
+          this.activePositions = rows;
+          resolve(rows);
+        }
+      });
+    });
+  }
+
+  async executeStrategy() {
+    try {
+      // Получаем свечи
+      const candles = await getCandleData();
+      if (candles.length < 20) {
+        logger.warn('Not enough data for analysis');
+        return;
+      }
+
+      // Рассчитываем индикаторы
+      const { ma, rsi, macd, atr } = calculateIndicators(candles);
+      const lastClose = candles[candles.length-1].close;
+      const signal = this.generateSignal(lastClose, ma, rsi, macd);
+
+      // Управление риском
+      const riskManager = new RiskManager();
+      await riskManager.adjustRiskParameters();
+      
+      // Исполнение сделок
+      if (signal === 'BUY') {
+        await this.executeBuy(lastClose, atr);
+      } else if (signal === 'SELL') {
+        await this.executeSell(lastClose, atr);
+      }
+
+      // Мониторинг позиций
+      await this.monitorPositions(lastClose);
+
+    } catch (error) {
+      logger.error('Strategy execution error:', error);
+    }
+  }
+
+  generateSignal(lastClose, ma, rsi, macd) {
+    if (!ma || !rsi || !macd) return 'HOLD';
     
-    return activeOrders;
+    const lastMA = ma[ma.length - 1];
+    const lastRSI = rsi[rsi.length - 1];
+    const lastMACD = macd[macd.length - 1];
+
+    // Пример простой стратегии
+    if (lastClose > lastMA && lastRSI < 30 && lastMACD.histogram > 0) {
+      return 'BUY';
+    } else if (lastClose < lastMA && lastRSI > 70 && lastMACD.histogram < 0) {
+      return 'SELL';
+    }
+    return 'HOLD';
+  }
+
+  async executeBuy(price, atr) {
+    try {
+      // Расчет стоп-лосса
+      const stopLossPrice = price * (1 - (atr/price + config.trailingStopOffset/100));
+      
+      // Расчет размера позиции
+      const positionSize = await new RiskManager().calculatePositionSize(price, stopLossPrice);
+      
+      if (positionSize <= 0) {
+        logger.warn('Position size too small', { positionSize });
+        return;
+      }
+      
+      // Проверка баланса
+      const portfolioValue = await new RiskManager().getPortfolioValue();
+      if (portfolioValue < positionSize) {
+        logger.warn('Insufficient balance', { required: positionSize, available: portfolioValue });
+        return;
+      }
+      
+      // Создание транзакции Stellar
+      const account = await server.loadAccount(accountKeypair.publicKey());
+      
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: Networks.TESTNET
+      })
+        .addOperation(Operation.payment({
+          destination: accountKeypair.publicKey(),
+          asset: baseAsset,
+          amount: positionSize.toString()
+        }))
+        .setTimeout(30)
+        .build();
+      
+      transaction.sign(accountKeypair);
+      const result = await server.submitTransaction(transaction);
+      
+      logger.info('Buy order executed:', { hash: result.hash, positionSize });
+      
+      // Сохранение позиции в БД
+      const positionId = await this.savePosition(price, positionSize, 'LONG', stopLossPrice, price * 1.05);
+      
+      // Запись в историю
+      await new RiskManager().recordTrade({
+        position_id: positionId,
+        type: 'BUY',
+        price: price,
+        amount: positionSize,
+        profit: 0,
+        timestamp: Math.floor(Date.now() / 1000)
+      });
+    } catch (error) {
+      logger.error('Buy order failed:', error);
+    }
+  }
+
+  async executeSell(price, atr) {
+    try {
+      // Расчет стоп-лосса
+      const stopLossPrice = price * (1 + (atr/price + config.trailingStopOffset/100));
+      
+      // Расчет размера позиции
+      const positionSize = await new RiskManager().calculatePositionSize(price, stopLossPrice);
+      
+      if (positionSize <= 0) {
+        logger.warn('Position size too small', { positionSize });
+        return;
+      }
+      
+      // Проверка баланса
+      const account = await server.loadAccount(accountKeypair.publicKey());
+      const balance = account.balances.find(b => 
+        b.asset_type === 'credit_alphanum4' && 
+        b.asset_code === config.baseAssetCode &&
+        b.issuer === config.issuerAddress
+      )?.balance || 0;
+      
+      if (parseFloat(balance) < positionSize) {
+        logger.warn('Insufficient asset balance', { required: positionSize, available: balance });
+        return;
+      }
+      
+      // Создание транзакции Stellar
+      const transaction = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: Networks.TESTNET
+      })
+        .addOperation(Operation.payment({
+          destination: accountKeypair.publicKey(),
+          asset: counterAsset,
+          amount: positionSize.toString()
+        }))
+        .setTimeout(30)
+        .build();
+      
+      transaction.sign(accountKeypair);
+      const result = await server.submitTransaction(transaction);
+      
+      logger.info('Sell order executed:', { hash: result.hash, positionSize });
+      
+      // Сохранение позиции в БД
+      const positionId = await this.savePosition(price, positionSize, 'SHORT', stopLossPrice, price * 0.95);
+      
+      // Запись в историю
+      await new RiskManager().recordTrade({
+        position_id: positionId,
+        type: 'SELL',
+        price: price,
+        amount: positionSize,
+        profit: 0,
+        timestamp: Math.floor(Date.now() / 1000)
+      });
+    } catch (error) {
+      logger.error('Sell order failed:', error);
+    }
+  }
+
+  async savePosition(entryPrice, size, direction, stopLoss, takeProfit) {
+    return new Promise((resolve, reject) => {
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT INTO positions (entry_price, position_size, direction, stop_loss, take_profit, opened_at) 
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [entryPrice, size, direction, stopLoss, takeProfit, now],
+        function(err) {
+          if (err) {
+            logger.error('Failed to save position:', err);
+            reject(err);
+          } else {
+            logger.info('Position saved:', { id: this.lastID });
+            resolve(this.lastID);
+          }
+        }
+      );
+    });
+  }
+
+  async updateOrder(orderId, newPrice) {
+    // В Stellar это требует создания нового ордера и отмены старого
+    logger.info('Updating order:', { orderId, newPrice });
+  }
+
+  async monitorPositions(currentPrice) {
+    for (const position of this.activePositions) {
+      let shouldClose = false;
+      
+      // Проверка стоп-лосса
+      if (position.direction === 'LONG' && currentPrice <= position.stop_loss) {
+        logger.info('Stop loss triggered for long position:', { id: position.id });
+        shouldClose = true;
+      } else if (position.direction === 'SHORT' && currentPrice >= position.stop_loss) {
+        logger.info('Stop loss triggered for short position:', { id: position.id });
+        shouldClose = true;
+      }
+      
+      // Проверка take profit
+      if (position.direction === 'LONG' && currentPrice >= position.take_profit) {
+        logger.info('Take profit reached for long position:', { id: position.id });
+        shouldClose = true;
+      } else if (position.direction === 'SHORT' && currentPrice <= position.take_profit) {
+        logger.info('Take profit reached for short position:', { id: position.id });
+        shouldClose = true;
+      }
+      
+      // Обновление трейлинг-стопа
+      await this.updateTrailingStop(position, currentPrice);
+      
+      // Закрытие позиции
+      if (shouldClose) {
+        await this.closePosition(position, currentPrice);
+      }
+    }
+  }
+
+  async updateTrailingStop(position, currentPrice) {
+    const offset = currentPrice * (config.trailingStopOffset/100);
+    
+    if (position.direction === 'LONG') {
+      const newStop = currentPrice - offset;
+      if (newStop > position.stop_loss) {
+        await this.updateOrder(position.id, newStop);
+        db.run(`UPDATE positions SET stop_loss = ? WHERE id = ?`, [newStop, position.id]);
+        logger.info('Trailing stop updated for long position:', { id: position.id, newStop });
+      }
+    } else {
+      const newStop = currentPrice + offset;
+      if (newStop < position.stop_loss) {
+        await this.updateOrder(position.id, newStop);
+        db.run(`UPDATE positions SET stop_loss = ? WHERE id = ?`, [newStop, position.id]);
+        logger.info('Trailing stop updated for short position:', { id: position.id, newStop });
+      }
+    }
+  }
+
+  async closePosition(position, currentPrice) {
+    try {
+      // Рассчитываем прибыль
+      let profit = 0;
+      if (position.direction === 'LONG') {
+        profit = (currentPrice - position.entry_price) / position.entry_price;
+      } else {
+        profit = (position.entry_price - currentPrice) / position.entry_price;
+      }
+      
+      // Создаем транзакцию закрытия
+      const account = await server.loadAccount(accountKeypair.publicKey());
+      
+      if (position.direction === 'LONG') {
+        // Продаем актив
+        const transaction = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: Networks.TESTNET
+        })
+          .addOperation(Operation.payment({
+            destination: accountKeypair.publicKey(),
+            asset: counterAsset,
+            amount: position.position_size.toString()
+          }))
+          .setTimeout(30)
+          .build();
+        
+        transaction.sign(accountKeypair);
+        await server.submitTransaction(transaction);
+      } else {
+        // Покупаем актив
+        const transaction = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: Networks.TESTNET
+        })
+          .addOperation(Operation.payment({
+            destination: accountKeypair.publicKey(),
+            asset: baseAsset,
+            amount: position.position_size.toString()
+          }))
+          .setTimeout(30)
+          .build();
+        
+        transaction.sign(accountKeypair);
+        await server.submitTransaction(transaction);
+      }
+      
+      // Обновляем позицию в БД
+      const now = new Date().toISOString();
+      db.run(`UPDATE positions SET closed_at = ? WHERE id = ?`, [now, position.id]);
+      
+      // Обновляем историю сделок
+      await new RiskManager().recordTrade({
+        position_id: position.id,
+        type: 'CLOSE',
+        price: currentPrice,
+        amount: position.position_size,
+        profit: profit,
+        timestamp: Math.floor(Date.now() / 1000)
+      });
+      
+      logger.info('Position closed:', { id: position.id, profit: profit * 100 + '%' });
+    } catch (error) {
+      logger.error('Failed to close position:', error);
+    }
+  }
+}
+
+// 8. СИСТЕМА МОНИТОРИНГА И ЗАЩИТЫ
+class HealthMonitor {
+  constructor() {
+    this.lastHeartbeat = Date.now();
+    this.systemMetrics = {
+      uptime: 0,
+      trades: 0,
+      errors: 0,
+      successRate: 100
+    };
+  }
+
+  async checkHealth() {
+    try {
+      // Проверяем подключение к Stellar
+      await server.loadAccount(accountKeypair.publicKey());
+      
+      // Проверяем доступность БД
+      await new Promise((resolve, reject) => {
+        db.get('SELECT 1', [], (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      
+      this.lastHeartbeat = Date.now();
+      return true;
+    } catch (error) {
+      logger.error('System health check failed:', error);
+      this.handleFailure();
+      return false;
+    }
+  }
+
+  handleFailure() {
+    // Останавливаем торги
+    clearInterval(this.tradingInterval);
+    
+    // Отправляем уведомление
+    this.sendAlert('Trading bot has stopped due to system failure');
+    
+    // Перезапускаем систему через 5 минут
+    setTimeout(() => {
+      logger.info('Restarting trading bot...');
+      this.startMonitoring();
+    }, 300000);
+  }
+
+  sendAlert(message) {
+    // Реализация отправки уведомлений (email, Telegram, Slack и т.д.)
+    logger.warn('ALERT:', message);
+  }
+
+  startMonitoring() {
+    this.tradingInterval = setInterval(async () => {
+      const health = await this.checkHealth();
+      if (health) {
+        this.systemMetrics.uptime += config.tradeInterval;
+      }
+    }, config.tradeInterval);
+  }
+}
+
+// 9. ОСНОВНЫЕ ФУНКЦИИ
+async function getCandleData() {
+  try {
+    // Получение последних сделок из Stellar
+    const tradesResponse = await server.trades()
+      .forAssetPair(baseAsset, counterAsset)
+      .limit(config.candleLimit)
+      .order('desc')
+      .call();
+    
+    // Агрегация в свечи
+    const aggregator = new CandleAggregator(config.candleInterval);
+    tradesResponse.records.forEach(trade => {
+      aggregator.addTrade(trade);
+    });
+    
+    return aggregator.getCandles(config.candleLimit);
   } catch (error) {
-    logger.error('Ошибка при проверке ордеров:', error.message);
+    logger.error('Failed to get candle data:', error);
     return [];
   }
 }
 
-// Кэшированный баланс
-let balanceCache = {
-  ruvBalance: 0,
-  xlmBalance: 0,
-  lastUpdated: 0
-};
+function calculateIndicators(candles) {
+  if (!candles.length) return {};
+  
+  const closes = candles.map(c => c.close);
+  const highs = candles.map(c => c.high);
+  const lows = candles.map(c => c.low);
 
-// Функция для получения баланса аккаунта
-async function getAccountBalance(forceUpdate = false) {
-  if (testMode && !forceUpdate) {
-    logger.info(`Тестовый режим: XLM=${testXlmBalance}, RUV=${testRuvBalance}`);
-    return { ruvBalance: testRuvBalance, xlmBalance: testXlmBalance };
-  }
-  
-  // Кэшируем баланс на 10 секунд
-  if (!forceUpdate && Date.now() - balanceCache.lastUpdated < 10000) {
-    return balanceCache;
-  }
-  
   try {
-    const accountResponse = await withRetry(async () =>
-      await server.loadAccount(accountKeypair.publicKey())
-    );
+    return {
+      ma: indicators.SMA.calculate({ period: 14, values: closes }),
+      rsi: indicators.RSI.calculate({ period: 14, values: closes }),
+      macd: indicators.MACD.calculate({ 
+        values: closes,
+        fastPeriod: 12,
+        slowPeriod: 26,
+        signalPeriod: 9
+      }),
+      atr: indicators.ATR.calculate({
+        values: candles.map(c => ({ high: c.high, low: c.low, close: c.close })),
+        period: 14
+      })
+    };
+  } catch (error) {
+    logger.error('Indicator calculation error:', error);
+    return {};
+  }
+}
+
+// 10. ОСНОВНОЙ ЦИКЛ
+async function startTradingBot() {
+  try {
+    const trader = new TradingEngine();
+    const riskManager = new RiskManager();
+    const healthMonitor = new HealthMonitor();
     
-    let ruvBalance = 0;
-    let xlmBalance = 0;
+    // Инициализация начального баланса
+    config.startingBalance = await riskManager.getPortfolioValue();
     
-    for (const balance of accountResponse.balances) {
-      if (balance.asset_code === baseAssetCode && balance.asset_issuer === issuerAddress) {
-        ruvBalance = parseFloat(balance.balance);
-      } else if (balance.asset_type === 'native') {
-        xlmBalance = parseFloat(balance.balance);
+    // Синхронизация позиций
+    await trader.syncOpenPositions();
+    
+    // Запуск основного цикла
+    const runCycle = async () => {
+      try {
+        await trader.executeStrategy();
+        await riskManager.adjustRiskParameters();
+      } catch (error) {
+        logger.error('Cycle error:', error);
       }
-    }
-    
-    balanceCache = {
-      ruvBalance,
-      xlmBalance,
-      lastUpdated: Date.now()
     };
     
-    logger.info(`Баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
-    return balanceCache;
+    // Запуск циклов
+    healthMonitor.startMonitoring();
+    setInterval(runCycle, config.tradeInterval);
+    
+    logger.info('Trading bot started successfully');
+    runCycle(); // Запуск первого цикла сразу
+    
   } catch (error) {
-    logger.error('Ошибка при получении баланса:', error.message);
-    throw error;
-  }
-}
-
-// Кэшированная история трейдов
-let tradeHistoryCache = {
-  data: [],
-  lastUpdated: 0
-};
-
-// Функция для получения истории трейдов
-async function getTradeHistory(limit = 100, forceUpdate = false) {
-  if (!forceUpdate && Date.now() - tradeHistoryCache.lastUpdated < 5000) {
-    return tradeHistoryCache.data;
-  }
-  
-  try {
-    const response = await withRetry(async () =>
-      await server.trades()
-        .forAssetPair(baseAsset, counterAsset)
-        .limit(limit)
-        .call()
-    );
-    
-    const history = response.records.map(record => ({
-      price: parseFloat(record.price),
-      baseAmount: parseFloat(record.base_amount),
-      counterAmount: parseFloat(record.counter_amount),
-      time: record.ledger_close_time,
-      volume: parseFloat(record.base_amount) * parseFloat(record.price)
-    }));
-    
-    tradeHistoryCache = {
-      data: history,
-      lastUpdated: Date.now()
-    };
-    
-    return history;
-  } catch (error) {
-    logger.error('Ошибка при получении истории трейдов:', error.message);
-    throw error;
-  }
-}
-
-// Расширенный расчет индикаторов с ATR
-function calculateIndicators(prices) {
-  if (!prices || prices.length < 14) {
-    logger.warn('Недостаточно данных для расчета индикаторов');
-    return { ma: [], rsi: [], macd: [], signal: [], atr: [] };
-  }
-  
-  const closePrices = prices.map(p => p.price);
-  const highPrices = prices.map(p => p.high || p.price * 1.01);
-  const lowPrices = prices.map(p => p.low || p.price * 0.99);
-  const volume = prices.map(p => p.volume);
-  
-  // MA (Moving Average)
-  const ma = indicators.SMA.calculate({ period: 14, values: closePrices });
-  
-  // RSI (Relative Strength Index)
-  const rsi = indicators.RSI.calculate({ period: 14, values: closePrices });
-  
-  // MACD (Moving Average Convergence Divergence)
-  const macd = indicators.MACD.calculate({ 
-    shortPeriod: 12, 
-    longPeriod: 26, 
-    signalPeriod: 9, 
-    values: closePrices 
-  });
-  
-  // ATR (Average True Range)
-  const atr = indicators.ATR.calculate({
-    period: 14,
-    high: highPrices,
-    low: lowPrices,
-    close: closePrices
-  });
-  
-  // Сохраняем последние значения в БД
-  if (ma.length > 0 && rsi.length > 0 && macd.length > 0 && atr.length > 0) {
-    const lastMa = ma[ma.length - 1];
-    const lastRsi = rsi[rsi.length - 1];
-    const lastMacd = macd[0][macd[0].length - 1];
-    const lastSignal = macd[1][macd[1].length - 1];
-    const lastAtr = atr[atr.length - 1];
-    
-    db.run(
-      'INSERT INTO indicators (ma, rsi, macd, signal, atr) VALUES (?, ?, ?, ?, ?)',
-      [lastMa, lastRsi, lastMacd, lastSignal, lastAtr],
-      (err) => {
-        if (err) logger.error('Ошибка сохранения индикаторов:', err.message);
-      }
-    );
-  }
-  
-  return { ma, rsi, macd, signal: macd[1], atr };
-}
-
-// Функция для создания ордера
-async function createOrder(sellingAsset, buyingAsset, amount, price, isBuy) {
-  try {
-    // Проверяем существующие ордера с retry
-    const existingOrders = await withRetry(checkExistingOrders);
-    
-    // Проверка дубликатов с учетом offerId
-    const isDuplicate = existingOrders.some(order => 
-      Math.abs(order.price - price) < 0.000001 && 
-      Math.abs(order.amount - amount) < 0.000001 &&
-      order.type === (isBuy ? 'buy' : 'sell')
-    );
-    
-    if (isDuplicate) {
-      logger.warn('Обнаружен дублирующийся ордер, пропускаем создание');
-      return null;
-    }
-    
-    // Получаем аккаунт с retry
-    const accountResponse = await withRetry(() => 
-      server.loadAccount(accountKeypair.publicKey())
-    );
-    
-    // Создаем транзакцию
-    const transaction = new TransactionBuilder(accountResponse, {
-      fee: TransactionBuilder.BASE_FEE,
-      networkPassphrase: Networks.PUBLIC
-    })
-      .addOperation(Operation.manageSellOffer({
-        selling: sellingAsset,
-        buying: buyingAsset,
-        amount: amount.toFixed(7),
-        price: price.toString(),
-        offerId: '0'
-      }))
-      .setTimeout(30)
-      .build();
-    
-    transaction.sign(accountKeypair);
-    
-    // Отправляем транзакцию с retry
-    const result = await withRetry(() => 
-      server.submitTransaction(transaction)
-    );
-    
-    // Сохраняем информацию об ордере с offerId
-    db.run(
-      'INSERT INTO orders (order_id, type, price, amount, status) VALUES (?, ?, ?, ?, ?)',
-      [result.hash, isBuy ? 'buy' : 'sell', price, amount, 'created'],
-      (err) => {
-        if (err) logger.error('Ошибка сохранения ордера:', err.message);
-      }
-    );
-    
-    logger.info(`${isBuy ? 'Ордер на покупку' : 'Ордер на продажу'} создан:`, result.hash);
-    return result.hash;
-  } catch (error) {
-    logger.error(`Ошибка при создании ордера: ${error.message}`);
-    return null;
-  }
-}
-
-// Функция для создания ордера на покупку
-async function createBuyOrder(price, amount) {
-  return createOrder(counterAsset, baseAsset, amount, price, true);
-}
-
-// Функция для создания ордера на продажу
-async function createSellOrder(price, amount) {
-  return createOrder(baseAsset, counterAsset, amount, price, false);
-}
-
-// Расширенная стратегия торговли
-async function analyzeMarket() {
-  try {
-    const tradeHistory = await getTradeHistory(100);
-    const indicatorsData = calculateIndicators(tradeHistory);
-    
-    if (!indicatorsData.ma.length || 
-        !indicatorsData.rsi.length || 
-        !indicatorsData.macd.length || 
-        !indicatorsData.atr.length) {
-      logger.warn('Недостаточно данных для анализа');
-      return;
-    }
-    
-    const lastPrice = tradeHistory[tradeHistory.length - 1].price;
-    const ma = indicatorsData.ma[indicatorsData.ma.length - 1];
-    const rsi = indicatorsData.rsi[indicatorsData.rsi.length - 1];
-    const macdLine = indicatorsData.macd[indicatorsData.macd.length - 1];
-    const signalLine = indicatorsData.signal[indicatorsData.signal.length - 1];
-    const atr = indicatorsData.atr[indicatorsData.atr.length - 1];
-    
-    logger.info(`Текущая цена: ${lastPrice.toFixed(7)}`);
-    logger.info(`MA: ${ma.toFixed(7)}, RSI: ${rsi.toFixed(2)}, MACD: ${macdLine.toFixed(7)}, Signal: ${signalLine.toFixed(7)}, ATR: ${atr.toFixed(7)}`);
-    
-    let shouldBuy = false;
-    let shouldSell = false;
-    
-    // Улучшенная стратегия с учетом нескольких факторов
-    if (lastPrice > ma && 
-        rsi < 30 && 
-        macdLine > signalLine && 
-        tradeHistory[tradeHistory.length - 1].volume > 100) {
-      shouldBuy = true;
-    } else if (lastPrice < ma && 
-               rsi > 70 && 
-               macdLine < signalLine && 
-               tradeHistory[tradeHistory.length - 1].volume > 100) {
-      shouldSell = true;
-    }
-    
-    if (!shouldBuy && !shouldSell) {
-      logger.info('Текущие условия не подходят для сделки.');
-      return;
-    }
-    
-    const { ruvBalance, xlmBalance } = await getAccountBalance(true);
-    logger.info(`Текущий баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
-    
-    // Расчет позиционного размера с учетом ATR
-    const positionSize = calculatePositionSize(rsi, atr, xlmBalance, ruvBalance);
-    
-    if (shouldBuy && xlmBalance >= positionSize.minXlm) {
-      const buyPrice = calculateOptimalPrice(lastPrice, 'buy', atr);
-      const buyAmount = Math.min(
-        positionSize.amount, 
-        xlmBalance * 0.9 // Резервируем 10% для комиссий
-      );
-      
-      if (buyAmount >= 0.0000001) {
-        await createBuyOrder(buyPrice, buyAmount);
-        await createStopLossAndTakeProfit(buyPrice, buyAmount, true);
-      }
-    } 
-    else if (shouldSell && ruvBalance >= positionSize.minRuv) {
-      const sellPrice = calculateOptimalPrice(lastPrice, 'sell', atr);
-      const sellAmount = Math.min(
-        positionSize.amount, 
-        ruvBalance * 0.9
-      );
-      
-      if (sellAmount >= 0.001) {
-        await createSellOrder(sellPrice, sellAmount);
-        await createStopLossAndTakeProfit(sellPrice, sellAmount, false);
-      }
-    }
-  } catch (error) {
-    logger.error('Ошибка в анализе рынка:', error.message);
-  }
-}
-
-// Расчет размера позиции с учетом рисков
-function calculatePositionSize(rsi, atr, xlmBalance, ruvBalance) {
-  const baseRisk = 0.02; // 2% от капитала
-  const volatilityFactor = 1 / (1 + (atr / 0.01)); // Нормализация ATR
-  
-  // Адаптация под RSI
-  let riskMultiplier = 1;
-  if (rsi < 20 || rsi > 80) riskMultiplier = 1.5; // Усиление позиции при экстремальных значениях RSI
-  
-  const capital = Math.min(
-    xlmBalance * 0.5, // Используем максимум 50% баланса
-    ruvBalance * 0.5
-  );
-  
-  return {
-    amount: capital * baseRisk * volatilityFactor * riskMultiplier,
-    minXlm: 0.0000001,
-    minRuv: 0.001
-  };
-}
-
-// Расчет оптимальной цены с учетом ATR
-function calculateOptimalPrice(lastPrice, type, atr) {
-  const offset = atr * 0.5; // Половина ATR
-  return type === 'buy' ? lastPrice * 0.995 - offset : lastPrice * 1.005 + offset;
-}
-
-// Функция для создания стоп-лосс и тейк-профит ордеров
-async function createStopLossAndTakeProfit(entryPrice, amount, isBuyOrder) {
-  try {
-    const stopLossPrice = isBuyOrder 
-      ? entryPrice * (1 - stopLossPercent / 100) 
-      : entryPrice * (1 + stopLossPercent / 100);
-    const takeProfitPrice = isBuyOrder 
-      ? entryPrice * (1 + takeProfitPercent / 100) 
-      : entryPrice * (1 - takeProfitPercent / 100);
-    
-    logger.info(`Создание стоп-лосс: ${stopLossPrice}, тейк-профит: ${takeProfitPrice}`);
-    
-    // Добавляем защиту от слишком близких уровней
-    if (isBuyOrder) {
-      if (takeProfitPrice > entryPrice * 1.001) {
-        await createSellOrder(takeProfitPrice, amount);
-      }
-      if (stopLossPrice < entryPrice * 0.999) {
-        await createSellOrder(stopLossPrice, amount);
-      }
-    } else {
-      if (takeProfitPrice < entryPrice * 0.999) {
-        await createBuyOrder(takeProfitPrice, amount);
-      }
-      if (stopLossPrice > entryPrice * 1.001) {
-        await createBuyOrder(stopLossPrice, amount);
-      }
-    }
-  } catch (error) {
-    logger.error('Ошибка при создании стоп-лосс/тейк-профит:', error.message);
-  }
-}
-
-// Запуск бота с перезапуском при критических ошибках
-async function startBot() {
-  logger.info('Бот запущен. Начинаю анализ рынка...');
-  
-  let restartAttempts = 0;
-  const maxRestartAttempts = 5;
-  
-  try {
-    const network = await withRetry(() => server.fetchBaseFee());
-    logger.info(`Подключение к сети Stellar успешно. Базовая комиссия: ${network}`);
-  } catch (error) {
-    logger.error('Не удалось подключиться к сети Stellar:', error.message);
+    logger.error('Fatal error:', error);
     process.exit(1);
   }
-  
-  // Первый запуск немедленно
-  await analyzeMarket();
-  
-  // Запуск по расписанию
-  setInterval(async () => {
-    try {
-      await analyzeMarket();
-      restartAttempts = 0; // Сброс счетчика при успешном запуске
-    } catch (error) {
-      logger.error('Критическая ошибка в работе бота:', error.message);
-      restartAttempts++;
-      
-      if (restartAttempts >= maxRestartAttempts) {
-        logger.error(`Достигнуто максимальное количество попыток перезапуска (${maxRestartAttempts})`);
-        process.exit(1);
-      }
-      
-      logger.info(`Попытка перезапуска через ${restartAttempts * 30} секунд`);
-      setTimeout(async () => {
-        try {
-          await analyzeMarket();
-          restartAttempts = 0;
-        } catch (error) {
-          logger.error('Ошибка при перезапуске:', error.message);
-        }
-      }, restartAttempts * 30000);
-    }
-  }, tradeInterval);
 }
 
-startBot();
+// 11. ОБРАБОТЧИКИ ОШИБОК
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', error => {
+  logger.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+// ЗАПУСК БОТА
+startTradingBot();
