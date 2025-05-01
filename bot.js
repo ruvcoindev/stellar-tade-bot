@@ -748,5 +748,106 @@ process.on('uncaughtException', error => {
   process.exit(1);
 });
 
+// 12. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ТЕСТНЕТА
+function generateTestnetKeys() {
+  const keypair = Keypair.random();
+  const keys = {
+    secret: keypair.secret(),
+    publicKey: keypair.publicKey(),
+    network: Networks.TESTNET
+  };
+  
+  logger.info('Generated testnet keys:', {
+    publicKey: keys.publicKey,
+    secret: keys.secret
+  });
+  
+  return keys;
+}
+
+async function fundWithFriendbot(publicKey) {
+  try {
+    const friendbotUrl = 'https://friendbot.stellar.org';
+    const response = await fetch(`${friendbotUrl}?addr=${encodeURIComponent(publicKey)}`);
+    
+    if (response.status === 200) {
+      logger.info('Account funded successfully');
+      return true;
+    } else {
+      const error = await response.json();
+      logger.error('Failed to fund account:', error);
+      return false;
+    }
+  } catch (error) {
+    logger.error('Friendbot request failed:', error);
+    return false;
+  }
+}
+
+// 13. ОБРАБОТЧИК КОМАНДНОЙ СТРОКИ
+async function handleCommandLineArgs() {
+  const args = process.argv.slice(2);
+  
+  if (args.includes('--generate-keys')) {
+    logger.info('Generating testnet keys...');
+    const keys = generateTestnetKeys();
+    logger.info(`Save these keys securely:\nSecret: ${keys.secret}\nPublic Key: ${keys.publicKey}`);
+    process.exit(0);
+  }
+  
+  if (args.includes('--fund-with-friendbot')) {
+    const publicKeyIndex = args.indexOf('--fund-with-friendbot') + 1;
+    if (publicKeyIndex >= args.length) {
+      logger.error('Public key required for friendbot funding');
+      process.exit(1);
+    }
+    
+    const publicKey = args[publicKeyIndex];
+    logger.info(`Funding account ${publicKey} with friendbot...`);
+    const success = await fundWithFriendbot(publicKey);
+    process.exit(success ? 0 : 1);
+  }
+}
+
+// 14. ОСНОВНОЙ ЦИКЛ ЗАПУСКА
+async function startTradingBot() {
+  try {
+    // Обработка командной строки
+    await handleCommandLineArgs();
+    
+    // Основная логика бота
+    const trader = new TradingEngine();
+    const riskManager = new RiskManager();
+    const healthMonitor = new HealthMonitor();
+    
+    // Инициализация начального баланса
+    config.startingBalance = await riskManager.getPortfolioValue();
+    
+    // Синхронизация позиций
+    await trader.syncOpenPositions();
+    
+    // Запуск основного цикла
+    const runCycle = async () => {
+      try {
+        await trader.executeStrategy();
+        await riskManager.adjustRiskParameters();
+      } catch (error) {
+        logger.error('Cycle error:', error);
+      }
+    };
+    
+    // Запуск циклов
+    healthMonitor.startMonitoring();
+    setInterval(runCycle, config.tradeInterval);
+    
+    logger.info('Trading bot started successfully');
+    runCycle(); // Запуск первого цикла сразу
+    
+  } catch (error) {
+    logger.error('Fatal error:', error);
+    process.exit(1);
+  }
+}
+
 // ЗАПУСК БОТА
 startTradingBot();
