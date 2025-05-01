@@ -92,13 +92,7 @@ function createTables() {
   });
 }
 
-// Инициализация Stellar SDK
-try {
-  Network.usePublicNetwork();
-} catch (error) {
-  logger.error('Ошибка инициализации сети Stellar:', error.message);
-  process.exit(1);
-}
+
 
 const server = new Server(horizonUrl, {
   allowHttp: horizonUrl.includes('testnet')
