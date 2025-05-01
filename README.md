@@ -25,7 +25,7 @@
 
 ## Установка
 ```bash
-npm install stellar-sdk axios dotenv winston technicalindicators nodemailer jest @jest/globals
+npm install @stellar/stellar-sdk axios dotenv winston technicalindicators nodemailer sqlite3 chart.js
 npm install --save-dev supertest
 npm install
 node bot.js
