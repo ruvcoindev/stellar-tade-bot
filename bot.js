@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Server, Keypair, Asset, TransactionBuilder, Operation, Network } = require('@stellar/stellar-sdk');
+const { Server, Keypair, Asset, TransactionBuilder, Operation, Networks } = require('@stellar/stellar-sdk');
 const axios = require('axios');
 const winston = require('winston');
 const { format, transports } = winston;
@@ -25,7 +25,7 @@ const logger = winston.createLogger({
   ]
 });
 
-// Настройки из .env
+// Настройки
 const secretKey = process.env.SECRET_KEY;
 const issuerAddress = process.env.ISSUER_ADDRESS;
 const baseAssetCode = process.env.BASE_ASSET_CODE;
@@ -92,8 +92,7 @@ function createTables() {
   });
 }
 
-
-
+// Инициализация Stellar SDK
 const server = new Server(horizonUrl, {
   allowHttp: horizonUrl.includes('testnet')
 });
@@ -200,7 +199,7 @@ async function createBuyOrder(price, amount) {
     const accountResponse = await server.loadAccount(accountKeypair.publicKey());
     const transaction = new TransactionBuilder(accountResponse, {
       fee: TransactionBuilder.BASE_FEE,
-      networkPassphrase: Network.current().networkPassphrase
+      networkPassphrase: Networks.PUBLIC
     })
       .addOperation(Operation.manageSellOffer({
         selling: counterAsset,
@@ -237,7 +236,7 @@ async function createSellOrder(price, amount) {
     const accountResponse = await server.loadAccount(accountKeypair.publicKey());
     const transaction = new TransactionBuilder(accountResponse, {
       fee: TransactionBuilder.BASE_FEE,
-      networkPassphrase: Network.current().networkPassphrase
+      networkPassphrase: Networks.PUBLIC
     })
       .addOperation(Operation.manageSellOffer({
         selling: baseAsset,
