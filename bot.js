@@ -93,7 +93,6 @@ function createTables() {
 }
 
 // Инициализация Stellar SDK
-const { Server, Keypair, Asset, TransactionBuilder, Operation, Network } = require('@stellar/stellar-sdk');
 Network.usePublicNetwork(); // Установка сети
 const server = new Server(horizonUrl, {
   allowHttp: horizonUrl.includes('testnet') // Только для тестовой сети
