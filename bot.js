@@ -1,5 +1,5 @@
 require('dotenv').config();
-const StellarSdk = require('stellar-sdk');
+const { Server, Keypair, Asset, TransactionBuilder, Operation, Network } = require('@stellar/stellar-sdk');
 const axios = require('axios');
 const winston = require('winston');
 const indicators = require('technicalindicators');
