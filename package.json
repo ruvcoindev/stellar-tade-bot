@@ -1,0 +1,27 @@
+{
+  "name": "stellar-trading-bot",
+  "version": "1.0.0",
+  "description": "Automated trading bot for Stellar network",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^5.0.0",
+    "dotenv": "^16.0.3",
+    "technicalindicators": "^3.7.0",
+    "winston": "^3.8.2",
+    "winston-daily-rotate-file": "^4.0.10",
+    "sqlite3": "^5.0.2",
+    "node-fetch": "^3.3.1"
+  },
+  "devDependencies": {
+    "jest": "^29.5.0",
+    "nodemon": "^2.0.22"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
