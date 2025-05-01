@@ -2,10 +2,11 @@ require('dotenv').config();
 const { Server, Keypair, Asset, TransactionBuilder, Operation, Network } = require('@stellar/stellar-sdk');
 const axios = require('axios');
 const winston = require('winston');
-const indicators = require('technicalindicators');
-const nodemailer = require('nodemailer');
 const { format, transports } = winston;
 const { combine, timestamp, printf } = format;
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+const path = require('path');
 
 // Настройка логгера
 const logFormat = printf(({ level, message, timestamp }) => {
@@ -34,24 +35,76 @@ const tradeInterval = parseInt(process.env.TRADE_INTERVAL);
 const minProfitThreshold = parseFloat(process.env.MIN_PROFIT_THRESHOLD);
 const stopLossPercent = parseFloat(process.env.STOP_LOSS_PERCENT);
 const takeProfitPercent = parseFloat(process.env.TAKE_PROFIT_PERCENT);
+const testMode = process.env.TEST_MODE === 'true';
+const testXlmBalance = parseFloat(process.env.TEST_XLM_BALANCE);
+const testRuvBalance = parseFloat(process.env.TEST_RUV_BALANCE);
 
-// Настройки email
-const emailUser = process.env.EMAIL_USER;
-const emailPassword = process.env.EMAIL_PASSWORD;
-const emailTo = process.env.EMAIL_TO;
+// Инициализация базы данных
+const dbPath = path.join(__dirname, process.env.DATABASE_NAME);
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    logger.error('Ошибка подключения к БД:', err.message);
+  } else {
+    logger.info('Подключение к SQLite БД успешно');
+    createTables();
+  }
+});
+
+function createTables() {
+  const createTradesTable = `
+    CREATE TABLE IF NOT EXISTS trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      price REAL,
+      amount REAL,
+      type TEXT,
+      profit REAL
+    )`;
+
+  const createIndicatorsTable = `
+    CREATE TABLE IF NOT EXISTS indicators (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      ma REAL,
+      rsi REAL,
+      macd REAL,
+      signal REAL
+    )`;
+
+  const createOrdersTable = `
+    CREATE TABLE IF NOT EXISTS orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      type TEXT,
+      price REAL,
+      amount REAL,
+      status TEXT
+    )`;
+
+  db.run(createTradesTable, (err) => {
+    if (err) logger.error('Ошибка создания таблицы trades:', err.message);
+  });
+  db.run(createIndicatorsTable, (err) => {
+    if (err) logger.error('Ошибка создания таблицы indicators:', err.message);
+  });
+  db.run(createOrdersTable, (err) => {
+    if (err) logger.error('Ошибка создания таблицы orders:', err.message);
+  });
+}
 
 // Инициализация Stellar SDK
-StellarSdk.Network.usePublicNetwork();
-StellarSdk.Server.allowHttp(horizonUrl.includes('testnet'));
-const server = new StellarSdk.Server(horizonUrl);
-const accountKeypair = StellarSdk.Keypair.fromSecret(secretKey);
+Network.usePublicNetwork();
+const server = new Server(horizonUrl, {
+  allowHttp: horizonUrl.includes('testnet')
+});
+const accountKeypair = Keypair.fromSecret(secretKey);
 
 // Определение активов
-const baseAsset = new StellarSdk.Asset(baseAssetCode, issuerAddress);
-const counterAsset = StellarSdk.Asset.native(); // XLM
+const baseAsset = new Asset(baseAssetCode, issuerAddress);
+const counterAsset = Asset.native(); // XLM
 
 // Функция для проверки лимитов Horizon API
-function checkApiRateLimits(response) {
+async function checkApiRateLimits(response) {
   const remaining = parseInt(response.headers['x-ratelimit-remaining']);
   const limit = parseInt(response.headers['x-ratelimit-limit']);
   const resetTime = new Date(parseInt(response.headers['x-ratelimit-reset']) * 1000);
@@ -66,6 +119,11 @@ function checkApiRateLimits(response) {
 
 // Функция для получения баланса аккаунта
 async function getAccountBalance() {
+  if (testMode) {
+    logger.info(`Тестовый режим: XLM=${testXlmBalance}, RUV=${testRuvBalance}`);
+    return { ruvBalance: testRuvBalance, xlmBalance: testXlmBalance };
+  }
+
   try {
     const accountResponse = await server.loadAccount(accountKeypair.publicKey());
     const balances = accountResponse.balances;
@@ -81,7 +139,7 @@ async function getAccountBalance() {
       }
     }
     
-    logger.info(`Баланс: RUV=${ruvBalance.toFixed(7)}, XLM=${xlmBalance.toFixed(7)}`);
+    logger.info(`Баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
     return { ruvBalance, xlmBalance };
   } catch (error) {
     logger.error('Ошибка при получении баланса:', error.message);
@@ -89,27 +147,62 @@ async function getAccountBalance() {
   }
 }
 
-// Функция для получения текущей книги ордеров
-async function getOrderBook() {
+// Функция для получения истории трейдов
+async function getTradeHistory(limit = 100) {
   try {
-    const response = await server.orderbook(baseAsset, counterAsset).call();
-    checkApiRateLimits(response); // Проверка лимитов
-    return response;
+    const response = await server.trades().forAssetPair(baseAsset, counterAsset).limit(limit).call();
+    await checkApiRateLimits(response); // Проверка лимитов
+    return response.records.map(record => ({
+      price: parseFloat(record.price),
+      baseAmount: parseFloat(record.base_amount),
+      counterAmount: parseFloat(record.counter_amount),
+      time: record.ledger_close_time
+    }));
   } catch (error) {
-    logger.error('Ошибка при получении книги ордеров:', error.message);
+    logger.error('Ошибка при получении истории трейдов:', error.message);
     throw error;
   }
+}
+
+// Функция для расчета индикаторов
+function calculateIndicators(prices) {
+  const closePrices = prices.map(p => p.price).reverse(); // Новые данные в конце
+  if (closePrices.length < 14) {
+    logger.warn('Недостаточно данных для расчета индикаторов');
+    return { ma: [], rsi: [], macd: [] };
+  }
+  
+  // MA (Moving Average)
+  const ma = require('technicalindicators').SMA.calculate({ period: 14, values: closePrices });
+  // RSI (Relative Strength Index)
+  const rsi = require('technicalindicators').RSI.calculate({ period: 14, values: closePrices });
+  // MACD (Moving Average Convergence Divergence)
+  const macd = require('technicalindicators').MACD.calculate({ 
+    shortPeriod: 12, 
+    longPeriod: 26, 
+    signalPeriod: 9, 
+    values: closePrices 
+  });
+  
+  // Сохранение индикаторов в БД
+  if (ma.length > 0 && rsi.length > 0 && macd.length > 0) {
+    const stmt = db.prepare('INSERT INTO indicators (ma, rsi, macd, signal) VALUES (?, ?, ?, ?)');
+    stmt.run(ma[ma.length - 1], rsi[rsi.length - 1], macd[0][macd[0].length - 1], macd[1][macd[1].length - 1]);
+    stmt.finalize();
+  }
+  
+  return { ma, rsi, macd };
 }
 
 // Функция для создания ордера на покупку
 async function createBuyOrder(price, amount) {
   try {
     const accountResponse = await server.loadAccount(accountKeypair.publicKey());
-    const transaction = new StellarSdk.TransactionBuilder(accountResponse, {
-      fee: StellarSdk.BASE_FEE,
-      networkPassphrase: StellarSdk.Networks.PUBLIC
+    const transaction = new TransactionBuilder(accountResponse, {
+      fee: TransactionBuilder.BASE_FEE,
+      networkPassphrase: Network.current().networkPassphrase
     })
-      .addOperation(StellarSdk.Operation.manageSellOffer({
+      .addOperation(Operation.manageSellOffer({
         selling: counterAsset,
         buying: baseAsset,
         amount: amount.toFixed(7),
@@ -122,7 +215,11 @@ async function createBuyOrder(price, amount) {
     transaction.sign(accountKeypair);
     const result = await server.submitTransaction(transaction);
     logger.info('Ордер на покупку создан:', result.hash);
-    sendEmail('Ордер на покупку создан', `Цена: ${price}, Кол-во: ${amount}`);
+    
+    // Сохранение ордера в БД
+    const stmt = db.prepare('INSERT INTO orders (type, price, amount, status) VALUES (?, ?, ?, ?)');
+    stmt.run('buy', price, amount, 'pending');
+    stmt.finalize();
     
     // Создание стоп-лосс и тейк-профит
     await createStopLossAndTakeProfit(price, amount, true);
@@ -138,11 +235,11 @@ async function createBuyOrder(price, amount) {
 async function createSellOrder(price, amount) {
   try {
     const accountResponse = await server.loadAccount(accountKeypair.publicKey());
-    const transaction = new StellarSdk.TransactionBuilder(accountResponse, {
-      fee: StellarSdk.BASE_FEE,
-      networkPassphrase: StellarSdk.Networks.PUBLIC
+    const transaction = new TransactionBuilder(accountResponse, {
+      fee: TransactionBuilder.BASE_FEE,
+      networkPassphrase: Network.current().networkPassphrase
     })
-      .addOperation(StellarSdk.Operation.manageSellOffer({
+      .addOperation(Operation.manageSellOffer({
         selling: baseAsset,
         buying: counterAsset,
         amount: amount.toFixed(7),
@@ -155,7 +252,11 @@ async function createSellOrder(price, amount) {
     transaction.sign(accountKeypair);
     const result = await server.submitTransaction(transaction);
     logger.info('Ордер на продажу создан:', result.hash);
-    sendEmail('Ордер на продажу создан', `Цена: ${price}, Кол-во: ${amount}`);
+    
+    // Сохранение ордера в БД
+    const stmt = db.prepare('INSERT INTO orders (type, price, amount, status) VALUES (?, ?, ?, ?)');
+    stmt.run('sell', price, amount, 'pending');
+    stmt.finalize();
     
     // Создание стоп-лосс и тейк-профит
     await createStopLossAndTakeProfit(price, amount, false);
@@ -190,98 +291,6 @@ async function createStopLossAndTakeProfit(entryPrice, amount, isBuyOrder) {
   } catch (error) {
     logger.error('Ошибка при создании стоп-лосс/тейк-профит:', error.message);
   }
-}
-
-// Функция для получения истории трейдов
-async function getTradeHistory(limit = 100) {
-  try {
-    const response = await server.trades().forAssetPair(baseAsset, counterAsset).limit(limit).call();
-    checkApiRateLimits(response); // Проверка лимитов
-    return response.records.map(record => ({
-      price: parseFloat(record.price),
-      baseAmount: parseFloat(record.base_amount),
-      counterAmount: parseFloat(record.counter_amount),
-      time: record.ledger_close_time
-    }));
-  } catch (error) {
-    logger.error('Ошибка при получении истории трейдов:', error.message);
-    throw error;
-  }
-}
-
-// Функция для расчета индикаторов
-function calculateIndicators(prices) {
-  const closePrices = prices.map(p => p.price).reverse(); // Новые данные в конце
-  if (closePrices.length < 14) {
-    logger.warn('Недостаточно данных для расчета индикаторов');
-    return { ma: [], rsi: [], macd: [] };
-  }
-  
-  // MA (Moving Average)
-  const ma = indicators.SMA.calculate({ period: 14, values: closePrices });
-  // RSI (Relative Strength Index)
-  const rsi = indicators.RSI.calculate({ period: 14, values: closePrices });
-  // MACD (Moving Average Convergence Divergence)
-  const macd = indicators.MACD.calculate({ 
-    shortPeriod: 12, 
-    longPeriod: 26, 
-    signalPeriod: 9, 
-    values: closePrices 
-  });
-  
-  return { ma, rsi, macd };
-}
-
-// Функция для отслеживания статуса ордеров
-async function trackOrders() {
-  try {
-    const offersResponse = await server.offers().forAccount(accountKeypair.publicKey()).call();
-    checkApiRateLimits(offersResponse); // Проверка лимитов
-    
-    const activeOffers = offersResponse.records.filter(offer => {
-      const isSellingBase = offer.selling_asset_type === 'credit_alphanum4' && 
-                           offer.selling_asset_code === baseAssetCode && 
-                           offer.selling_asset_issuer === issuerAddress;
-      const isBuyingBase = offer.buying_asset_type === 'credit_alphanum4' && 
-                          offer.buying_asset_code === baseAssetCode && 
-                          offer.buying_asset_issuer === issuerAddress;
-      return isSellingBase || isBuyingBase;
-    });
-    
-    logger.info(`Найдено активных ордеров: ${activeOffers.length}`);
-    activeOffers.forEach(offer => {
-      logger.info(`ID: ${offer.id}, Цена: ${offer.price}, Кол-во: ${offer.amount}`);
-    });
-  } catch (error) {
-    logger.error('Ошибка при отслеживании ордеров:', error.message);
-    throw error;
-  }
-}
-
-// Функция для отправки email
-function sendEmail(subject, body) {
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: emailUser,
-      pass: emailPassword
-    }
-  });
-  
-  const mailOptions = {
-    from: emailUser,
-    to: emailTo,
-    subject,
-    text: body
-  };
-  
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      logger.error('Ошибка при отправке email:', error.message);
-    } else {
-      logger.info('Email успешно отправлен:', info.response);
-    }
-  });
 }
 
 // Функция для анализа рынка и принятия решений
@@ -337,12 +346,35 @@ async function analyzeMarket() {
       const sellAmountRUV = Math.min(ruvBalance * 0.5, 10); // Половина баланса, максимум 10 RUV
       await createSellOrder(sellPrice, sellAmountRUV);
     }
-    
-    // Отслеживаем статус ордеров
-    await trackOrders();
   } catch (error) {
     logger.error('Ошибка в анализе рынка:', error.message);
   }
+}
+
+// Функция для отправки email
+function sendEmail(subject, body) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: emailUser,
+      pass: emailPassword
+    }
+  });
+  
+  const mailOptions = {
+    from: emailUser,
+    to: emailTo,
+    subject,
+    text: body
+  };
+  
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      logger.error('Ошибка при отправке email:', error.message);
+    } else {
+      logger.info('Email успешно отправлен:', info.response);
+    }
+  });
 }
 
 // Запуск бота
