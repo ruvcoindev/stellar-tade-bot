@@ -1,6 +1,6 @@
 // bot.js
 require('dotenv').config();
-const { Horizon, Keypair, Asset, TransactionBuilder, Operation, Networks, BASE_FEE } = require('@stellar/stellar-sdk');
+const { Server, Keypair, Asset, TransactionBuilder, Operation, Networks, BASE_FEE } = require('@stellar/stellar-sdk');
 const winston = require('winston');
 const { format, transports } = winston;
 const { combine, timestamp, printf } = format;
