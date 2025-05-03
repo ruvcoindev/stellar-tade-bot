@@ -1,14 +1,13 @@
 require('dotenv').config();
-const { Server, Keypair, Asset, TransactionBuilder, Operation, Networks } = require('@stellar/stellar-sdk');
+const StellarSdk = require('stellar-sdk');
+const axios = require('axios');
 const winston = require('winston');
 const { format, transports } = winston;
 const { combine, timestamp, printf } = format;
 const indicators = require('technicalindicators');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const DailyRotateFile = require('winston-daily-rotate-file');
+const nodemailer = require('nodemailer');
 
-// 1. ИНИЦИАЛИЗАЦИЯ ЛОГГЕРА
+// Настройка логгера
 const logFormat = printf(({ level, message, timestamp }) => {
   return `${timestamp} [${level.toUpperCase()}]: ${message}`;
 });
@@ -20,256 +19,298 @@ const logger = winston.createLogger({
     logFormat
   ),
   transports: [
-    new DailyRotateFile({
-      filename: process.env.LOG_FILE || 'bot-%DATE%.log',
-      datePattern: 'YYYY-MM-DD',
-      zippedArchive: true,
-      maxSize: '20m',
-      maxFiles: '14d'
-    }),
+    new transports.File({ filename: process.env.LOG_FILE }),
     new transports.Console()
   ]
 });
 
-// 2. КОНФИГУРАЦИЯ
-const config = {
-  secretKey: process.env.SECRET_KEY,
-  issuerAddress: process.env.ISSUER_ADDRESS,
-  baseAssetCode: process.env.BASE_ASSET_CODE,
-  horizonUrl: process.env.HORIZON_URL || "https://horizon-testnet.stellar.org",
-  tradeInterval: parseInt(process.env.TRADE_INTERVAL) || 30000,
-  riskPerTrade: parseFloat(process.env.RISK_PER_TRADE) || 0.02,
-  maxPortfolioRisk: parseFloat(process.env.MAX_PORTFOLIO_RISK) || 0.2,
-  trailingStopOffset: parseFloat(process.env.TRAILING_STOP) || 1.5,
-  candleInterval: '5m',
-  candleLimit: 100
-};
+// Настройки
+const secretKey = process.env.SECRET_KEY;
+const issuerAddress = process.env.ISSUER_ADDRESS;
+const baseAssetCode = process.env.BASE_ASSET_CODE;
+const counterAssetCode = process.env.COUNTER_ASSET_CODE;
+const horizonUrl = process.env.HORIZON_URL;
+const tradeInterval = parseInt(process.env.TRADE_INTERVAL);
+const minProfitThreshold = parseFloat(process.env.MIN_PROFIT_THRESHOLD);
+const stopLossPercent = parseFloat(process.env.STOP_LOSS_PERCENT) || 2;
+const takeProfitPercent = parseFloat(process.env.TAKE_PROFIT_PERCENT) || 5;
 
-// 3. ИНИЦИАЛИЗАЦИЯ STELLAR SDK
-const server = new Server(config.horizonUrl, {
-  allowHttp: config.horizonUrl.includes('testnet')
-});
-const accountKeypair = Keypair.fromSecret(config.secretKey);
-const baseAsset = new Asset(config.baseAssetCode, config.issuerAddress);
-const counterAsset = Asset.native(); // XLM
+// Настройки email
+const emailUser = process.env.EMAIL_USER;
+const emailPassword = process.env.EMAIL_PASSWORD;
+const emailTo = process.env.EMAIL_TO;
 
-// 4. БАЗА ДАННЫХ
-const db = new sqlite3.Database(path.join(__dirname, 'trading.db'), err => {
-  if (err) logger.error('DB error:', err.message);
-  else logger.info('Connected to SQLite');
-});
+// Инициализация Stellar SDK
+StellarSdk.Server.allowHttp(true); // Разрешить HTTP (только для тестовой сети)
+const server = new StellarSdk.Server(horizonUrl);
+const accountKeypair = StellarSdk.Keypair.fromSecret(secretKey);
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS positions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_price REAL,
-    position_size REAL,
-    direction TEXT,
-    stop_loss REAL,
-    take_profit REAL,
-    trailing_stop REAL,
-    opened_at DATETIME,
-    closed_at DATETIME
-  )`);
+// Определение активов
+const baseAsset = new StellarSdk.Asset(baseAssetCode, issuerAddress);
+const counterAsset = StellarSdk.Asset.native(); // XLM
 
-  db.run(`CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
-    type TEXT,
-    price REAL,
-    amount REAL,
-    status TEXT,
-    created_at DATETIME,
-    updated_at DATETIME
-  )`);
-});
-
-// 5. КЛАСС УПРАВЛЕНИЯ РИСКАМИ
-class RiskManager {
-  constructor() {
-    this.volatilityWindow = 14;
-    this.startingBalance = 0;
-  }
-
-  async calculatePositionSize(entryPrice, stopLossPrice) {
-    try {
-      const account = await server.loadAccount(accountKeypair.publicKey());
-      const balance = account.balances.find(b => b.asset_type === 'native').balance;
-      const portfolioValue = parseFloat(balance);
-      
-      // Рассчитываем риск на сделку
-      const riskAmount = portfolioValue * config.riskPerTrade;
-      
-      // Рассчитываем волатильность
-      const candles = await getCandleData();
-      const atr = this.calculateATR(candles);
-      
-      // Размер позиции с учетом волатильности
-      const priceDistance = Math.abs(entryPrice - stopLossPrice);
-      const positionSize = (riskAmount / priceDistance) * (1 - atr/entryPrice);
-
-      return Math.min(positionSize, portfolioValue * 0.2); // Макс 20% портфеля
-    } catch (error) {
-      logger.error('Risk calculation failed:', error);
-      return 0;
-    }
-  }
-
-  async adjustRiskParameters() {
-    const portfolioValue = await this.getPortfolioValue();
-    const drawdown = await this.calculateDrawdown();
-    
-    // Динамическое уменьшение риска при просадках
-    if (drawdown > 0.1) {
-      config.riskPerTrade = Math.max(0.01, config.riskPerTrade * 0.8);
-    }
-    
-    // Увеличение риска при стабильной прибыли
-    if (portfolioValue > this.startingBalance * 1.2) {
-      config.riskPerTrade = Math.min(0.05, config.riskPerTrade * 1.1);
-    }
-  }
-
-  // Вспомогательные методы...
-}
-
-// 6. ТОРГОВЫЙ ДВИЖОК
-class TradingEngine {
-  constructor() {
-    this.activePositions = [];
-    this.pendingOrders = [];
-  }
-
-  async executeStrategy() {
-    try {
-      // 1. Получение рыночных данных
-      const candles = await getCandleData();
-      if (candles.length < 20) {
-        logger.warn('Not enough data for analysis');
-        return;
-      }
-
-      // 2. Расчет индикаторов
-      const { ma, rsi, macd } = calculateIndicators(candles);
-      
-      // 3. Генерация сигналов
-      const lastClose = candles[candles.length-1].price;
-      const signal = this.generateSignal(lastClose, ma, rsi, macd);
-      
-      // 4. Управление риском
-      const riskManager = new RiskManager();
-      await riskManager.adjustRiskParameters();
-      
-      // 5. Исполнение сделок
-      if (signal === 'BUY') {
-        await this.executeBuy(lastClose);
-      } else if (signal === 'SELL') {
-        await this.executeSell(lastClose);
-      }
-
-      // 6. Мониторинг позиций
-      await this.monitorPositions(lastClose);
-
-    } catch (error) {
-      logger.error('Strategy error:', error.message);
-    }
-  }
-
-  // Реализация трейлинг-стопа
-  async updateTrailingStop(position, currentPrice) {
-    const offset = currentPrice * (config.trailingStopOffset/100);
-    
-    if (position.direction === 'LONG') {
-      const newStop = currentPrice - offset;
-      if (newStop > position.stop_loss) {
-        await this.updateOrder(position.stop_loss_id, newStop);
-        position.stop_loss = newStop;
-      }
-    } else {
-      const newStop = currentPrice + offset;
-      if (newStop < position.stop_loss) {
-        await this.updateOrder(position.stop_loss_id, newStop);
-        position.stop_loss = newStop;
-      }
-    }
-  }
-
-  // Методы исполнения ордеров...
-}
-
-// 7. СЛОЖНЫЕ ПРАВИЛА УПРАВЛЕНИЯ КАПИТАЛОМ
-class KellyCalculator {
-  calculate(winRate, avgWin, avgLoss) {
-    const winRatio = avgWin / avgLoss;
-    return winRate - ((1 - winRate) / winRatio);
-  }
-}
-
-// 8. ЗАПУСК СИСТЕМЫ
-(async () => {
+// Функция для получения баланса аккаунта
+async function getAccountBalance() {
   try {
-    // Инициализация компонентов
-    const trader = new TradingEngine();
-    const riskManager = new RiskManager();
+    const accountResponse = await server.loadAccount(accountKeypair.publicKey());
+    const balances = accountResponse.balances;
 
-    // Основной цикл
-    const runCycle = async () => {
-      await trader.executeStrategy();
-      await riskManager.adjustRiskParameters();
-      setTimeout(runCycle, config.tradeInterval);
-    };
+    let ruvBalance = 0;
+    let xlmBalance = 0;
 
-    // Первоначальная синхронизация
-    await trader.syncOpenPositions();
-    runCycle();
+    for (const balance of balances) {
+      if (balance.asset_code === baseAssetCode && balance.asset_issuer === issuerAddress) {
+        ruvBalance = parseFloat(balance.balance);
+      } else if (balance.asset_type === 'native') {
+        xlmBalance = parseFloat(balance.balance);
+      }
+    }
 
+    logger.info(`Баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
+    return { ruvBalance, xlmBalance };
   } catch (error) {
-    logger.error('Fatal error:', error.message);
-    process.exit(1);
+    logger.error('Ошибка при получении баланса:', error.message);
+    throw error;
   }
-})();
+}
 
-// 9. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-async function getCandleData() {
+// Функция для получения истории трейдов
+async function getTradeHistory(limit = 100) {
   try {
-    const response = await server.trades()
-      .forAssetPair(baseAsset, counterAsset)
-      .limit(config.candleLimit)
-      .call();
-    
+    const response = await server.trades().forAssetPair(baseAsset, counterAsset).limit(limit).call();
     return response.records.map(record => ({
       price: parseFloat(record.price),
-      high: parseFloat(record.high),
-      low: parseFloat(record.low),
-      volume: parseFloat(record.volume),
+      baseAmount: parseFloat(record.base_amount),
+      counterAmount: parseFloat(record.counter_amount),
       time: record.ledger_close_time
     }));
   } catch (error) {
-    logger.error('Failed to get candles:', error.message);
-    return [];
+    logger.error('Ошибка при получении истории трейдов:', error.message);
+    throw error;
   }
 }
 
-function calculateIndicators(candles) {
-  const closes = candles.map(c => c.price);
-  const highs = candles.map(c => c.high);
-  const lows = candles.map(c => c.low);
+// Функция для расчета индикаторов
+function calculateIndicators(prices) {
+  const closePrices = prices.map(p => p.price).reverse(); // Новые данные в конце
 
-  return {
-    ma: indicators.SMA.calculate({ period: 14, values: closes }),
-    rsi: indicators.RSI.calculate({ period: 14, values: closes }),
-    macd: indicators.MACD.calculate({ 
-      values: closes,
-      fastPeriod: 12,
-      slowPeriod: 26,
-      signalPeriod: 9
-    }),
-    atr: indicators.ATR.calculate({
-      values: closes.map((c, i) => ({
-        high: highs[i],
-        low: lows[i],
-        close: c
-      })),
-      period: 14
-    })
-  };
+  if (closePrices.length < 14) {
+    logger.warn('Недостаточно данных для расчета индикatorов');
+    return { ma: [], rsi: [], macd: { macd: [], signal: [] } };
+  }
+
+  // MA (Moving Average)
+  const ma = indicators.SMA.calculate({ period: 14, values: closePrices });
+  // RSI (Relative Strength Index)
+  const rsi = indicators.RSI.calculate({ period: 14, values: closePrices });
+  // MACD (Moving Average Convergence Divergence)
+  const macd = indicators.MACD.calculate({
+    shortPeriod: 12,
+    longPeriod: 26,
+    signalPeriod: 9,
+    values: closePrices
+  });
+
+  return { ma, rsi, macd };
 }
+
+// Функция для создания ордера на покупку
+async function createBuyOrder(price, amount) {
+  try {
+    const accountResponse = await server.loadAccount(accountKeypair.publicKey());
+    const transaction = new StellarSdk.TransactionBuilder(accountResponse, {
+      fee: StellarSdk.BASE_FEE,
+      networkPassphrase: StellarSdk.Networks.PUBLIC
+    })
+      .addOperation(StellarSdk.Operation.manageSellOffer({
+        selling: counterAsset,
+        buying: baseAsset,
+        amount: amount.toFixed(7),
+        price: price.toString(),
+        offerId: '0'
+      }))
+      .setTimeout(30)
+      .build();
+
+    transaction.sign(accountKeypair);
+    const result = await server.submitTransaction(transaction);
+    logger.info('Ордер на покупку создан:', result.hash);
+
+    // Отправка email-уведомления
+    sendEmail('Ордер на покупку создан', `Цена: ${price}, Кол-во: ${amount}, Хэш: ${result.hash}`);
+
+    return result.hash;
+  } catch (error) {
+    logger.error('Ошибка при создании ордера на покупку:', error.message);
+    throw error;
+  }
+}
+
+// Функция для создания ордера на продажу
+async function createSellOrder(price, amount) {
+  try {
+    const accountResponse = await server.loadAccount(accountKeypair.publicKey());
+    const transaction = new StellarSdk.TransactionBuilder(accountResponse, {
+      fee: StellarSdk.BASE_FEE,
+      networkPassphrase: StellarSdk.Networks.PUBLIC
+    })
+      .addOperation(StellarSdk.Operation.manageSellOffer({
+        selling: baseAsset,
+        buying: counterAsset,
+        amount: amount.toFixed(7),
+        price: price.toString(),
+        offerId: '0'
+      }))
+      .setTimeout(30)
+      .build();
+
+    transaction.sign(accountKeypair);
+    const result = await server.submitTransaction(transaction);
+    logger.info('Ордер на продажу создан:', result.hash);
+
+    // Отправка email-уведомления
+    sendEmail('Ордер на продажу создан', `Цена: ${price}, Кол-во: ${amount}, Хэш: ${result.hash}`);
+
+    return result.hash;
+  } catch (error) {
+    logger.error('Ошибка при создании ордера на продажу:', error.message);
+    throw error;
+  }
+}
+
+// Функция для создания стоп-лосс и тейк-профит ордеров
+async function createStopLossAndTakeProfit(entryPrice, amount, isBuyOrder) {
+  try {
+    const stopLossPrice = isBuyOrder 
+      ? entryPrice * (1 - stopLossPercent / 100) 
+      : entryPrice * (1 + stopLossPercent / 100);
+
+    const takeProfitPrice = isBuyOrder 
+      ? entryPrice * (1 + takeProfitPercent / 100) 
+      : entryPrice * (1 - takeProfitPercent / 100);
+
+    logger.info(`Создание стоп-лосс: ${stopLossPrice}, тейк-профит: ${takeProfitPrice}`);
+
+    if (isBuyOrder) {
+      await createSellOrder(stopLossPrice, amount);
+      await createSellOrder(takeProfitPrice, amount);
+    } else {
+      await createBuyOrder(stopLossPrice, amount);
+      await createBuyOrder(takeProfitPrice, amount);
+    }
+  } catch (error) {
+    logger.error('Ошибка при создании стоп-лосс/тейк-профит:', error.message);
+  }
+}
+
+// Функция для анализа рынка и принятия решений
+async function analyzeMarket() {
+  try {
+    const tradeHistory = await getTradeHistory(100);
+    const indicatorsData = calculateIndicators(tradeHistory);
+
+    if (!indicatorsData.ma.length || !indicatorsData.rsi.length || !indicatorsData.macd.macd.length) {
+      logger.warn('Недостаточно данных для анализа');
+      return;
+    }
+
+    const lastPrice = tradeHistory[tradeHistory.length - 1].price;
+    const ma = indicatorsData.ma[indicatorsData.ma.length - 1];
+    const rsi = indicatorsData.rsi[indicatorsData.rsi.length - 1];
+    const macdLine = indicatorsData.macd.macd[indicatorsData.macd.macd.length - 1];
+    const signalLine = indicatorsData.macd.signal[indicatorsData.macd.signal.length - 1];
+
+    logger.info(`Текущая цена: ${lastPrice.toFixed(7)}`);
+    logger.info(`MA: ${ma.toFixed(7)}, RSI: ${rsi.toFixed(2)}, MACD: ${macdLine.toFixed(7)}, Signal: ${signalLine.toFixed(7)}`);
+
+    // Стратегия торговли
+    let shouldBuy = false;
+    let shouldSell = false;
+
+    // Условия для покупки
+    if (lastPrice > ma && rsi < 30 && macdLine > signalLine) {
+      shouldBuy = true;
+    }
+    // Условия для продажи
+    else if (lastPrice < ma && rsi > 70 && macdLine < signalLine) {
+      shouldSell = true;
+    }
+
+    if (!shouldBuy && !shouldSell) {
+      logger.info('Текущие условия не подходят для сделки.');
+      return;
+    }
+
+    // Получаем баланс аккаунта
+    const { ruvBalance, xlmBalance } = await getAccountBalance();
+    logger.info(`Текущий баланс: RUV=${ruvBalance.toFixed(2)}, XLM=${xlmBalance.toFixed(7)}`);
+
+    // Выполняем сделку
+    if (shouldBuy && xlmBalance >= 0.001) {
+      const buyPrice = lastPrice * 0.99; // Покупаем на 1% ниже текущей цены
+      const buyAmountXLM = Math.min(xlmBalance * 0.5, 10); // Половина баланса, максимум 10 XLM
+      const orderId = await createBuyOrder(buyPrice, buyAmountXLM);
+      await createStopLossAndTakeProfit(buyPrice, buyAmountXLM, true);
+    } 
+    else if (shouldSell && ruvBalance >= 0.001) {
+      const sellPrice = lastPrice * 1.01; // Продаем на 1% выше текущей цены
+      const sellAmountRUV = Math.min(ruvBalance * 0.5, 10); // Половина баланса, максимум 10 RUV
+      const orderId = await createSellOrder(sellPrice, sellAmountRUV);
+      await createStopLossAndTakeProfit(sellPrice, sellAmountRUV, false);
+    }
+  } catch (error) {
+    logger.error('Ошибка в анализе рынка:', error.message);
+  }
+}
+
+// Функция для отправки email
+function sendEmail(subject, body) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: emailUser,
+      pass: emailPassword
+    }
+  });
+
+  const mailOptions = {
+    from: emailUser,
+    to: emailTo,
+    subject,
+    text: body
+  };
+
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      logger.error('Ошибка при отправке email:', error.message);
+    } else {
+      logger.info('Email успешно отправлен:', info.response);
+    }
+  });
+}
+
+// Запуск бота
+async function startBot() {
+  logger.info('Бот запущен. Начинаю анализ рынка...');
+
+  // Проверка подключения к сети
+  try {
+    const network = await server.fetchBaseFee();
+    logger.info(`Подключение к сети Stellar успешно. Базовая комиссия: ${network}`);
+  } catch (error) {
+    logger.error('Не удалось подключиться к сети Stellar:', error.message);
+    process.exit(1);
+  }
+
+  // Запуск анализа
+  setInterval(async () => {
+    try {
+      await analyzeMarket();
+    } catch (error) {
+      logger.error('Критическая ошибка в работе бота:', error.message);
+      sendEmail('Критическая ошибка в торговом боте', `Ошибка: ${error.message}`);
+    }
+  }, tradeInterval);
+}
+
+startBot();
